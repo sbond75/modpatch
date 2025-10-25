@@ -175,17 +175,47 @@ If nil, defaults to the original file's directory.")
                 (file-name-directory patch))
     (mod-patch-original-mode 1)))
 
+(defun mod-patch--show-patched-content ()
+  "Replace current buffer with ORIGINAL ⊕ PATCH so you see the virtual file.
+Assumes `mod-patch-target-directory' is already set."
+  (let* ((orig   (buffer-file-name))
+         (patch  (mod-patch--patch-file orig))
+         (point  (point)))
+    (if (and patch (file-exists-p patch))
+        (let ((patched (make-temp-file "mod-patch-view")))
+          (unwind-protect
+              (if (mod-patch--apply-patch orig patch patched)
+                  (progn
+                    (let ((inhibit-read-only t))
+                      (erase-buffer)
+                      (insert-file-contents patched)
+                      (goto-char (min point (point-max)))
+                      (set-buffer-modified-p nil)))
+                (message "Patch failed to apply cleanly – showing original."))
+            (delete-file patched)))
+      (message "No patch file found; showing original."))))
+
 ;;;###autoload
 (defun mod-patch-toggle ()
-  "Toggle between virtual patch editing and real file editing."
+  "Toggle between editing the real file and the virtual patched view."
   (interactive)
+  ;; Always save first so nothing is lost.
+  (save-buffer)
   (cond
+   ;; --- Currently in patch view → switch to original -------------------
    (mod-patch-mode
-    (mod-patch-mode -1) (mod-patch-original-mode 1))
+    (mod-patch-mode -1)
+    (mod-patch-original-mode 1)
+    (revert-buffer :ignore-auto :noconfirm))
+   ;; --- Currently in original view → switch to patch view --------------
    (mod-patch-original-mode
-    (mod-patch-original-mode -1) (mod-patch-mode 1))
+    (mod-patch-original-mode -1)
+    (mod-patch-mode 1)
+    (mod-patch--show-patched-content))
+   ;; --- Neither mode active: default to patch view ---------------------
    (t
-    (mod-patch-mode 1))))
+    (mod-patch-mode 1)
+    (mod-patch--show-patched-content))))
 
 ;; ---------------------------------------------------------------------
 ;;  BEGIN multi-directory patch support
@@ -261,7 +291,8 @@ or the directory of ORIG."
     (setq-local mod-patch-target-directory
                 (file-name-as-directory (expand-file-name patch-dir)))
     (mod-patch--add-dir-for-orig orig mod-patch-target-directory)
-    (mod-patch-mode 1)))
+    (mod-patch-mode 1)
+    (mod-patch--show-patched-content)))
 
 ;;;; ---------------------------------------------------------------------
 ;;;; 4.  Refresh *all* patches after saving the real file

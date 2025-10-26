@@ -247,13 +247,17 @@ To do that robustly, we rewrite PATCH-TEXT so that all file headers
 
 (defun modpatch--ensure-patch-record (entry patch-file)
   "Return (ENTRY' . RECORD) where RECORD is the patch record for PATCH-FILE.
-If no record existed, create one with :file PATCH-FILE and :desired nil,
-append it to ENTRY's :patches, and return the updated ENTRY and new record."
+If none existed, create one with keys :file PATCH-FILE, :desired nil, :base-ref nil.
+Return the possibly-updated ENTRY and the record."
   (let* ((patch-file-abs (expand-file-name patch-file))
          (patches (plist-get entry :patches))
-         (record (modpatch--find-patch-record entry patch-file-abs)))
+         (record (cl-find patch-file-abs patches
+                          :key (lambda (rec) (plist-get rec :file))
+                          :test #'string-equal)))
     (unless record
-      (setq record (list :file patch-file-abs :desired nil))
+      (setq record (list :file patch-file-abs
+                         :desired nil
+                         :base-ref nil))
       (setq patches (append patches (list record)))
       (setf (plist-get entry :patches) patches))
     (cons entry record)))
@@ -306,15 +310,15 @@ In that case we let Emacs save normally, then regenerate patches after save.")
 ;;; Core save interception for patch mode
 
 (defun modpatch--write-contents ()
-  "Buffer-local hook for `write-contents-functions`.
+  "Intercept save in patch-authoring mode (not rebase mode).
 
-If we are in modpatch-mode and not in rebase mode:
-- Compute a unified diff between the on-disk base file and the current buffer.
-- Write that diff only to the active patch file.
-- Update that patch record's :desired.
-- Mark buffer unmodified and report success to Emacs.
+We only update the active patch file:
+- Compute diff between the current on-disk base and the buffer text.
+- Write that diff to the active patch file.
+- Store :desired (buffer text) and :base-ref (current base text) in the patch record.
+- Mark the buffer clean.
 
-Return non-nil to tell Emacs that the save was fully handled."
+Return non-nil so Emacs believes the buffer is saved and does not write the base file."
   (when (and modpatch-mode (not modpatch--rebase-mode-p))
     (unless modpatch--active-patch-file
       (user-error "No active patch file for this buffer. Use modpatch-add-patch-target or modpatch-switch-to-patch-target."))
@@ -324,22 +328,21 @@ Return non-nil to tell Emacs that the save was fully handled."
            (pair (modpatch--ensure-patch-record entry active-patch))
            (entry* (car pair))
            (record (cdr pair))
-           ;; Texts
            (base-text    (modpatch--read-file-as-string base))
            (desired-text (buffer-substring-no-properties (point-min) (point-max)))
-           ;; Create diff for only this patch
            (diff-str (modpatch--generate-diff
                       base-text desired-text
                       (concat base ".orig")
                       (concat base ".modpatch"))))
-      ;; Write the diff to just the active patch file
+      ;; write only this patch file
       (modpatch--write-string-to-file diff-str active-patch)
-      ;; Update this patch record's :desired
-      (setf (plist-get record :desired) desired-text)
-      ;; Save updated entry back and persist
+      ;; update record
+      (setf (plist-get record :desired)  desired-text)
+      (setf (plist-get record :base-ref) base-text)
+      ;; save back and persist
       (modpatch--set-entry base entry*)
       (modpatch-save-associations)
-      ;; Mark buffer clean for Emacs
+      ;; mark clean
       (set-buffer-modified-p nil)
       t)))
 
@@ -347,34 +350,62 @@ Return non-nil to tell Emacs that the save was fully handled."
 ;;; After-save hook for rebase mode
 
 (defun modpatch--after-save-rebase ()
-  "After saving the true base file on disk, regenerate every patch file.
+  "After saving the true base file on disk (in rebase mode):
 
 For each patch record:
-- We diff the new base file text on disk vs that record's :desired.
-- We rewrite that patch file with the new diff.
+1. Try to merge upstream changes into that patch's :desired using a
+   3-way merge of (:base-ref, new base, :desired). If merge succeeds
+   with no conflicts, update :desired and :base-ref.
 
-This keeps all patch files aligned with upstream edits made in rebase mode."
+2. Regenerate that patch file by diffing the *new* base text against
+   the (possibly merged) desired text.
+
+3. If merge produced conflicts, we keep the old desired text, still
+   regenerate the patch file from that unmerged desired, and emit a message."
   (when (and modpatch-mode modpatch--rebase-mode-p)
     (let* ((base modpatch--base-file)
            (entry (modpatch--get-entry base))
            (patches (plist-get entry :patches))
-           (base-text (modpatch--read-file-as-string base)))
+           (base-text-new (modpatch--read-file-as-string base)))
       (dolist (rec patches)
         (let* ((patch-file (plist-get rec :file))
-               (desired    (plist-get rec :desired)))
-          (unless desired
-            ;; If a patch record has no :desired yet, skip it. We have nothing
-            ;; to preserve for this patch.
-            (cl-return))
-          (let ((diff-str (modpatch--generate-diff
-                           base-text desired
-                           (concat base ".orig")
-                           (concat base ".modpatch"))))
-            (modpatch--write-string-to-file diff-str patch-file))))
-      ;; After we’ve rewritten all patch files, we could optionally refresh
-      ;; each record's :desired from disk, but it's not strictly required here.
+               (desired-old (plist-get rec :desired))
+               (base-old    (plist-get rec :base-ref)))
+
+          ;; If we don't have desired/base-ref recorded yet, skip merge attempt.
+          (let* ((merge-result
+                  (if (and desired-old base-old)
+                      (modpatch--three-way-merge base-old base-text-new desired-old)
+                    ;; No merge possible; just carry the old desired forward.
+                    (cons desired-old nil)))
+                 (desired-merged (car merge-result))
+                 (merge-reason   (cdr merge-result))
+                 ;; If merge had conflict, keep old desired.
+                 (desired-effective
+                  (if merge-reason desired-old desired-merged))
+                 ;; Compute new unified diff for this patch.
+                 (diff-str (modpatch--generate-diff
+                            base-text-new desired-effective
+                            (concat base ".orig")
+                            (concat base ".modpatch"))))
+
+            ;; Write patch file
+            (modpatch--write-string-to-file diff-str patch-file)
+
+            ;; Update record if merge succeeded without conflict
+            (unless merge-reason
+              (setf (plist-get rec :desired)  desired-effective)
+              (setf (plist-get rec :base-ref) base-text-new))
+
+            ;; Emit message if merge conflict happened
+            (when merge-reason
+              (message "modpatch: merge for %s had conflicts (%s); kept old desired"
+                       patch-file merge-reason)))))
+
+      ;; Save updated association table and persist
+      (modpatch--set-entry base entry)
       (modpatch-save-associations)
-      (message "modpatch: all patches updated for %s" base))))
+      (message "modpatch: all patches rebased and updated for %s" base))))
 
 
 
@@ -615,16 +646,13 @@ you're working on."
     (message "modpatch: now editing patch %s" modpatch--active-patch-file)))
 
 (defun modpatch--desired-for-patch (base-abs patch-file &optional force-recompute)
-  "Return the desired (patched) text for PATCH-FILE on BASE-ABS.
+  "Return desired text for PATCH-FILE against BASE-ABS.
 
-If FORCE-RECOMPUTE is non-nil, ignore any cached :desired and
-recompute by applying PATCH-FILE from disk to the current on-disk
-base file.
+If FORCE-RECOMPUTE is non-nil, ignore cached :desired and rebuild by
+applying PATCH-FILE (read from disk) to the current base file text.
 
-Otherwise reuse the :desired cached in the patch record if present.
-
-Always updates the patch record's :desired in `modpatch--table` and
-saves associations."
+In both cases, update the patch record's :desired and :base-ref in the table,
+and persist."
   (let* ((entry (modpatch--get-entry base-abs))
          (pair (modpatch--ensure-patch-record entry patch-file))
          (entry* (car pair))
@@ -635,11 +663,68 @@ saves associations."
              (patch-text (modpatch--read-file-as-string (plist-get record :file)))
              (rebuilt    (modpatch--apply-patch base-text patch-text)))
         (setq desired rebuilt)
-        (setf (plist-get record :desired) desired)))
-    ;; write back updated entry to table and persist
+        (setf (plist-get record :desired)  desired)
+        (setf (plist-get record :base-ref) base-text)))
+    ;; save entry updates and persist
     (modpatch--set-entry base-abs entry*)
     (modpatch-save-associations)
     (plist-get record :desired)))
+
+(defun modpatch--contains-merge-conflict-markers-p (text)
+  "Return non-nil if TEXT seems to contain diff3-style conflict markers."
+  (or (string-match-p "^<<<<<<< " text)
+      (string-match-p "^=======" text)
+      (string-match-p "^>>>>>>> " text)))
+
+(defun modpatch--three-way-merge (base-old base-new desired-old)
+  "Attempt a 3-way merge of BASE-OLD (common ancestor),
+BASE-NEW (upstream after edits), and DESIRED-OLD (our modded view).
+
+Return (MERGED . nil) on success, where MERGED is the merged text
+with upstream changes folded in.
+
+Return (DESIRED-OLD . REASON) on conflict, where REASON is a string
+describing why merge failed. In that case the caller should keep
+DESIRED-OLD as-is.
+
+This implementation shells out to diff3 -m."
+  (let* ((tmp-dir   (make-temp-file "modpatch-merge-" t))
+         (f-anc     (expand-file-name "A_ancestor" tmp-dir))
+         (f-up      (expand-file-name "B_upstream" tmp-dir))
+         (f-ours    (expand-file-name "C_desired"  tmp-dir))
+         (merge-buf (generate-new-buffer " *modpatch-merge*"))
+         merged-text reason status)
+    (unwind-protect
+        (progn
+          ;; write inputs
+          (with-temp-file f-anc (insert base-old))
+          (with-temp-file f-up  (insert base-new))
+          (with-temp-file f-ours(insert desired-old))
+
+          ;; Call diff3:
+          ;;   diff3 -m ours ancestor upstream
+          ;; We want: merge desired-old with base-new using base-old as common ancestor.
+          ;; diff3's -m output: conflict markers if conflicts.
+          (setq status
+                (call-process "diff3" nil merge-buf nil
+                              "-m" f-ours f-anc f-up))
+
+          ;; status 0 or 1 both can mean "merge complete" depending on system;
+          ;; we'll detect success by scanning for conflict markers.
+          (with-current-buffer merge-buf
+            (setq merged-text
+                  (buffer-substring-no-properties (point-min) (point-max))))
+
+          (if (modpatch--contains-merge-conflict-markers-p merged-text)
+              (setq reason "merge conflict")
+            (setq reason nil))
+
+          (cons merged-text reason))
+      ;; cleanup
+      (when (and tmp-dir (file-exists-p tmp-dir))
+        (ignore-errors (delete-directory tmp-dir t)))
+      (when (buffer-live-p merge-buf)
+        (kill-buffer merge-buf)))))
 
 (provide 'modpatch)
 

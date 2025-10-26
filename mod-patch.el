@@ -303,27 +303,36 @@ Return non-nil to tell Emacs the save is handled. :contentReference[oaicite:5]{i
 ;;; After-save hook for rebase mode
 
 (defun modpatch--after-save-rebase ()
-  "After saving the true base file on disk, regenerate patches from :desired."
+  "After saving the true base file on disk, regenerate patches and
+synchronize :desired so it stays authoritative."
   (when (and modpatch-mode modpatch--rebase-mode-p)
     (let* ((base modpatch--base-file)
            (entry (modpatch--get-entry base))
            (desired (plist-get entry :desired))
            (patches (plist-get entry :patches))
-           ;; new base on disk now:
+           ;; new base text on disk now:
            (base-text (modpatch--read-file-as-string base)))
       (unless desired
-        ;; If there's no :desired stored, nothing to do.
+        ;; If we somehow have no :desired, nothing to diff against.
         (message "modpatch: no desired content recorded for %s" base)
         (cl-return-from modpatch--after-save-rebase))
 
-      ;; Recompute diff (desired vs new base), overwrite patch files.
+      ;; Recompute the diff based on latest base-text vs desired,
+      ;; and overwrite all patch files.
       (let ((diff-str (modpatch--generate-diff
                        base-text desired
                        (concat base ".orig")
                        (concat base ".modpatch"))))
         (dolist (pf patches)
           (modpatch--write-string-to-file diff-str pf)))
-      (message "modpatch: patches updated for %s" base))))
+
+      ;; Also refresh :desired from patch files on disk, to keep it aligned
+      ;; with what will actually be reconstructed later.
+      (let* ((fresh-entry (modpatch--get-entry base))
+             (forced-desired
+              (modpatch--apply-all-patches-to-base base fresh-entry t)))
+        (ignore forced-desired)))))
+
 
 
 ;;; Mode toggles
@@ -366,12 +375,11 @@ Saving (C-x C-s) writes the base file, then patches are recalculated."
   "Leave rebase mode and return to patch-authoring mode.
 
 Steps:
-1. Make sure the association table still has a correct :desired.
-   If :desired is missing we recompute it by applying all patches to
-   the current on-disk base file.
-2. Replace the buffer text with that desired (patched) view.
-3. Remove the after-save hook and mark this buffer as patch-authoring,
-   so saving regenerates patch files instead of touching the base file."
+1. Recompute the patched (desired) view from disk, forcing use of the
+   latest patch files rather than any cached :desired.
+2. Replace the buffer text with that desired view.
+3. Remove rebase hooks and go back to patch-authoring semantics
+   (saving writes patch files, not the base file)."
   (interactive)
   (unless modpatch-mode
     (user-error "modpatch-mode is not active"))
@@ -380,13 +388,15 @@ Steps:
 
   (let* ((base modpatch--base-file)
          (entry (modpatch--get-entry base))
-         ;; Ensure :desired is populated/consistent.
-         (desired
-          (modpatch--apply-all-patches-to-base base entry)))
-    ;; Step 2: restore buffer to desired content.
+         ;; Force recompute so we read the newest .patch contents
+         ;; that were regenerated during rebase-mode saves.
+         (desired (modpatch--apply-all-patches-to-base base entry t)))
+    ;; Put that desired (patched) view into the buffer so that
+    ;; from this point forward, we are again editing the modded view
+    ;; instead of the literal on-disk base file.
     (modpatch--replace-buffer-with-text desired))
 
-  ;; Step 3: leave rebase mode.
+  ;; Drop after-save hook. We are no longer editing the real base file.
   (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
   (setq modpatch--rebase-mode-p nil)
 
@@ -395,20 +405,38 @@ Steps:
 
 ;;; Auto-activation on find-file
 
-(defun modpatch--apply-all-patches-to-base (base-abs entry)
-  "Return desired text for BASE-ABS. If entry already has :desired, reuse it.
-Otherwise, apply each patch in :patches to the current base to compute it,
-store it back in :desired, and return it."
+(defun modpatch--apply-all-patches-to-base (base-abs entry &optional force-recompute)
+  "Return the desired (patched) text for BASE-ABS.
+
+ENTRY is the plist stored in `modpatch--table` for BASE-ABS.
+
+If FORCE-RECOMPUTE is non-nil, we ignore any cached :desired in ENTRY
+and instead rebuild the desired text by applying the current on-disk
+patch files in :patches to the current on-disk base file. We then
+update ENTRY's :desired with that rebuilt text.
+
+If FORCE-RECOMPUTE is nil and ENTRY already has :desired, we reuse it.
+
+In all cases, we ensure `modpatch--table` is updated with the final
+:desired, and we persist associations so future sessions see the
+same state."
   (let* ((desired (plist-get entry :desired))
          (patches (plist-get entry :patches)))
-    (unless desired
+    (when (or force-recompute (null desired))
+      ;; Start from the current base file on disk.
       (let ((tmp (modpatch--read-file-as-string base-abs)))
+        ;; Apply each patch file in order. The result after all patches
+        ;; is the desired modded view.
         (dolist (pf patches)
           (let ((patch-text (modpatch--read-file-as-string pf)))
             (setq tmp (modpatch--apply-patch tmp patch-text))))
-        (setq desired tmp)
-        (setf (plist-get entry :desired) desired)
-        (modpatch--set-entry base-abs entry)))
+        (setq desired tmp))
+
+      ;; Update entry with the fresh desired state and write back.
+      (setf (plist-get entry :desired) desired)
+      (modpatch--set-entry base-abs entry)
+      (modpatch-save-associations))
+
     desired))
 
 (defun modpatch-maybe-activate ()

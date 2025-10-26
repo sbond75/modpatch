@@ -1,369 +1,293 @@
-;;; mod-patch.el --- Transparent patch-based editing for Emacs -*- lexical-binding: t; -*-
-
-;; Author: Your Name <you@example.com>
-;; Version: 0.1
-;; Package-Requires: ((emacs "27.1") (json "1.5"))
-;; Keywords: vc, patches, convenience
-;; URL: https://example.com/mod-patch
-;;
-;; SPDX-License-Identifier: MIT
-
-;;; Commentary:
-
-;; `mod-patch-mode’ lets you edit a source file *as usual* while saving all
-;; modifications into version-controlled *patch files* instead of overwriting
-;; the original on disk.  You may seamlessly switch between the original
-;; buffer and any of its associated patch buffers, keep persistent state
-;; between sessions, and recover gracefully from patch-application failures.
-;;
-;; Core user commands
-;; ------------------
-;; M-x mod-patch-setup-for-current-buffer   ─ enable patch management here
-;; M-x mod-patch-toggle                     ─ flip between original / last patch
-;; M-x mod-patch-switch                     ─ pick a specific patch to edit
-;; M-x mod-patch-merge-finish               ─ resolve a failed merge
-;;
-;; See the README/specification for the full feature list.
-
-;;; Code:
+;;; modpatch.el --- Patch-producing editing mode for game mods -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
-(require 'json)
 (require 'subr-x)
-(require 'diff-mode)
 
-;;;; ---------------------------------------------------------------------
-;;;; User options
-;;;; ---------------------------------------------------------------------
+(defgroup modpatch nil
+  "Edit files as mod patches instead of writing them directly."
+  :group 'tools)
 
-(defgroup mod-patch nil
-  "Patch-centric editing workflow."
-  :group 'convenience
-  :link '(url-link :tag "GitHub" "https://example.com/mod-patch"))
-
-(defcustom mod-patch-target-directory nil
-  "Directory in which to store patch files.
-If nil, patches are written next to the original file."
-  :type '(choice (const :tag "Beside original file" nil)
-                 (directory :tag "Specific directory")))
-
-(defcustom mod-patch-state-file
-  (expand-file-name "mod-patch-state.json" user-emacs-directory)
-  "File used to persist state across Emacs sessions."
+(defcustom modpatch-associations-file
+  (expand-file-name "modpatch-assoc.el" user-emacs-directory)
+  "File where modpatch persists associations (base file -> patches, desired text)."
   :type 'file)
 
-(defcustom mod-patch-diff-context 12
-  "Number of context lines to include when writing unified diffs."
-  :type 'integer)
+;; Internal global table:
+;; key   = absolute base file path (string)
+;; value = plist (:patches (list patchfile...) :desired desired-string)
+(defvar modpatch--table (make-hash-table :test 'equal))
 
-(defcustom mod-patch-recent-patches-limit 20
-  "Maximum patches remembered per original file."
-  :type 'integer)
+
+;;; Utility: file <-> string
 
-;;;; ---------------------------------------------------------------------
-;;;; Internal state helpers
-;;;; ---------------------------------------------------------------------
+(defun modpatch--read-file-as-string (file)
+  "Return FILE contents as a string (no text properties)."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (buffer-substring-no-properties (point-min) (point-max))))
 
-(defvar mod-patch--state (make-hash-table :test #'equal)
-  "Hash map: ORIGINAL-FILE → plist (:patches (...) :last-mode sym :last-patch str).")
+(defun modpatch--write-string-to-file (str file)
+  "Write STR to FILE atomically."
+  (let ((tmp (make-temp-file "modpatch-write-")))
+    (with-temp-file tmp
+      (insert str))
+    (make-directory (file-name-directory file) t)
+    (rename-file tmp file t)))
 
-(defun mod-patch--load-state ()
-  "Populate `mod-patch--state' from `mod-patch-state-file'."
-  (when (file-exists-p mod-patch-state-file)
-    (let ((json-object-type 'hash-table)
-          (json-array-type 'list))
-      (setq mod-patch--state
-            (json-read-file mod-patch-state-file)))))
+(defun modpatch--abs (file)
+  (expand-file-name file))
 
-(defun mod-patch--save-state ()
-  "Persist `mod-patch--state' to `mod-patch-state-file'."
-  (unless (file-directory-p (file-name-directory mod-patch-state-file))
-    (make-directory (file-name-directory mod-patch-state-file) t))
-  (with-temp-file mod-patch-state-file
-    (insert (json-encode mod-patch--state))))
+
+;;; Persistent association save/load
 
-(defun mod-patch--get-entry (orig)
-  "Return plist state entry for ORIG, initialising if necessary."
-  (or (gethash orig mod-patch--state)
-      (let ((entry (list :patches '() :last-mode 'original :last-patch nil)))
-        (puthash orig entry mod-patch--state)
+(defun modpatch-save-associations ()
+  "Persist `modpatch--table' to `modpatch-associations-file'."
+  (with-temp-file modpatch-associations-file
+    (let ((print-length nil)
+          (print-level nil))
+      (prin1
+       (let (alist)
+         (maphash (lambda (k v) (push (cons k v) alist)) modpatch--table)
+         alist)
+       (current-buffer)))))
+
+(defun modpatch-load-associations ()
+  "Load `modpatch--table' from `modpatch-associations-file', if it exists."
+  (when (file-readable-p modpatch-associations-file)
+    (with-temp-buffer
+      (insert-file-contents modpatch-associations-file)
+      (goto-char (point-min))
+      (let ((alist (read (current-buffer))))
+        (setq modpatch--table (make-hash-table :test 'equal))
+        (dolist (cell alist)
+          (puthash (car cell) (cdr cell) modpatch--table))))))
+
+;; Load on first require.
+(modpatch-load-associations)
+
+
+;;; Patch / diff primitives (stubs you must finish)
+
+(defun modpatch--generate-diff (base-text new-text base-name new-name)
+  "Return unified diff string that would transform BASE-TEXT into NEW-TEXT.
+BASE-NAME and NEW-NAME are just labels that will appear in the diff headers."
+  ;; Simplest approach: write both to temp files, call external diff -u.
+  ;; You must implement this for your platform.
+  (error "modpatch--generate-diff: not implemented"))
+
+(defun modpatch--apply-patch (base-text patch-text)
+  "Apply PATCH-TEXT (a unified diff) to BASE-TEXT and return the patched result.
+Signal an error if patch cannot be applied cleanly."
+  ;; Simplest approach: write BASE-TEXT to tmp file A, run `patch` with PATCH-TEXT
+  ;; into tmp file B, read B back. Or call into `epatch-buffer` in a temp buffer.
+  ;; See Emacs commands `epatch-buffer` / `diff-apply-hunk`. :contentReference[oaicite:4]{index=4}
+  (error "modpatch--apply-patch: not implemented"))
+
+
+;;; Internal: look up and update association entries
+
+(defun modpatch--get-entry (base-abs)
+  (or (gethash base-abs modpatch--table)
+      (let ((entry (list :patches nil :desired nil)))
+        (puthash base-abs entry modpatch--table)
         entry)))
 
-(defun mod-patch--update-entry (orig entry)
-  "Replace ORIG’s state ENTRY and persist."
-  (puthash orig entry mod-patch--state)
-  (mod-patch--save-state))
+(defun modpatch--set-entry (base-abs entry)
+  (puthash base-abs entry modpatch--table))
 
-;;;; ---------------------------------------------------------------------
-;;;; Minor mode locals
-;;;; ---------------------------------------------------------------------
+(defun modpatch-add-patch-target (patch-file)
+  "Interactively add PATCH-FILE as a patch target for the current buffer's base."
+  (interactive "FAdd patch file: ")
+  (unless (bound-and-true-p modpatch--base-file)
+    (user-error "Not in modpatch context"))
+  (let* ((base modpatch--base-file)
+         (abs (modpatch--abs patch-file))
+         (entry (modpatch--get-entry base))
+         (plist (copy-sequence entry))
+         (targets (plist-get plist :patches)))
+    (unless (member abs targets)
+      (setq targets (append targets (list abs))))
+    (setf (plist-get plist :patches) targets)
+    (modpatch--set-entry base plist)
+    (modpatch-save-associations)
+    (message "Added patch target %s" abs)))
 
-(defvar-local mod-patch--current-mode 'original
-  "Symbol: `original' or `patch'.")
+
+;;; Buffer-local state
 
-(defvar-local mod-patch--current-patch-file nil
-  "If in patch mode, absolute path of the patch file backing the buffer.")
+(defvar-local modpatch--base-file nil
+  "Absolute path of the base file for this buffer.")
 
-(defvar-local mod-patch--write-guard nil
-  "Non-nil while `write-contents-functions' is running (prevents recursion).")
+(defvar-local modpatch--rebase-mode-p nil
+  "Non-nil if this buffer is editing the true base on disk (modpatch-rebase-mode).
+In that case we let Emacs save normally, then regenerate patches after save.")
 
-;;;; ---------------------------------------------------------------------
-;;;; Utility helpers
-;;;; ---------------------------------------------------------------------
+
+;;; Core save interception for patch mode
 
-(defun mod-patch--patch-directory (orig)
-  "Return directory where patches for ORIG should be kept."
-  (or mod-patch-target-directory (file-name-directory orig)))
+(defun modpatch--write-contents ()
+  "Buffer-local hook for `write-contents-functions'.
+Instead of saving the buffer to the visited file, write/refresh patch files.
+Return non-nil to tell Emacs the save is handled. :contentReference[oaicite:5]{index=5}"
+  (when (and modpatch-mode (not modpatch--rebase-mode-p))
+    (let* ((base modpatch--base-file)
+           (entry (modpatch--get-entry base))
+           ;; What base currently looks like on disk:
+           (base-text (modpatch--read-file-as-string base))
+           ;; What user wants (this buffer):
+           (desired-text (buffer-substring-no-properties (point-min) (point-max)))
+           (patches (plist-get entry :patches)))
+      ;; Update :desired
+      (let ((new-entry (copy-sequence entry)))
+        (setf (plist-get new-entry :desired) desired-text)
+        (modpatch--set-entry base new-entry))
 
-(defun mod-patch--next-patch-path (orig)
-  "Compute a unique patch file path for ORIG."
-  (let* ((base (file-name-nondirectory orig))
-         (ts   (format-time-string "%Y%m%d%H%M%S"))
-         (name (format "%s.%s.patch" base ts)))
-    (expand-file-name name (mod-patch--patch-directory orig))))
+      ;; Compute diff and update every patch target.
+      (let ((diff-str (modpatch--generate-diff
+                       base-text desired-text
+                       (concat base ".orig")
+                       (concat base ".modpatch"))))
+        (dolist (pf patches)
+          (modpatch--write-string-to-file diff-str pf)))
 
-(defun mod-patch--write-diff (orig buf dest)
-  "Compute diff between ORIG (file path) and BUF (buffer object), writing to DEST."
-  (with-temp-buffer
-    (let ((diff-cmd (or (executable-find "diff") (error "diff(1) not found"))))
-      (unless (zerop
-               (call-process diff-cmd nil t nil
-                             "-u" (format "-U%d" mod-patch-diff-context)
-                             orig
-                             (progn
-                               ;; Save buffer to a temp file for diff input
-                               (setq dest (expand-file-name dest))
-                               (let ((tmp (make-temp-file "mod-patch-diff")))
-                                 (with-current-buffer buf
-                                   (write-region nil nil tmp nil 0))
-                                 tmp))))
-        (write-region (point-min) (point-max) dest nil 0)))))
+      ;; Persist associations.
+      (modpatch-save-associations)
 
-(defun mod-patch--apply-patch-to-region (patch-buf target-buf)
-  "Apply unified diff in PATCH-BUF to TARGET-BUF, replacing its contents.
-Return nil on success, or buffer with patch error output."
-  (let* ((patch-cmd (or (executable-find "patch") (error "patch(1) not found")))
-         (tmp (make-temp-file "mod-patch-orig"))
-         (out (generate-new-buffer "*mod-patch-errors*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer target-buf
-            (write-region nil nil tmp nil 0))
-          (with-current-buffer patch-buf
-            (unless (zerop
-                     (call-process-region (point-min) (point-max)
-                                          patch-cmd nil out nil
-                                          "-u" "-l" "-o" tmp tmp))
-              out)))
-      (with-current-buffer target-buf
-        (erase-buffer)
-        (insert-file-contents tmp))
-      (delete-file tmp))))
+      ;; Pretend buffer is saved.
+      (set-buffer-modified-p nil)
+      t)))
 
-(defun mod-patch--update-mode-line ()
-  "Refresh mode-line indicator."
-  (setq-local mode-name
-              (format "ModPatch[%s]"
-                      (if (eq mod-patch--current-mode 'original)
-                          "O"
-                        (file-name-nondirectory mod-patch--current-patch-file))))
-  (force-mode-line-update))
+
+;;; After-save hook for rebase mode
 
-;;;; ---------------------------------------------------------------------
-;;;; Writing interception (original mode)
-;;;; ---------------------------------------------------------------------
+(defun modpatch--after-save-rebase ()
+  "After saving the true base file on disk, regenerate patches from :desired."
+  (when (and modpatch-mode modpatch--rebase-mode-p)
+    (let* ((base modpatch--base-file)
+           (entry (modpatch--get-entry base))
+           (desired (plist-get entry :desired))
+           (patches (plist-get entry :patches))
+           ;; new base on disk now:
+           (base-text (modpatch--read-file-as-string base)))
+      (unless desired
+        ;; If there's no :desired stored, nothing to do.
+        (message "modpatch: no desired content recorded for %s" base)
+        (cl-return-from modpatch--after-save-rebase))
 
-(defun mod-patch--write-contents-hook ()
-  "Intercept `save-buffer' when in original mode, writing patch instead."
-  (unless mod-patch--write-guard
-    (setq mod-patch--write-guard t)
-    (unwind-protect
-        (let* ((orig (buffer-file-name))
-               (patch (mod-patch--next-patch-path orig)))
-          (mod-patch--write-diff orig (current-buffer) patch)
-          ;; Update persistent state
-          (let* ((entry (mod-patch--get-entry orig))
-                 (plist (plist-put entry :patches
-                                   (cl-subseq (push patch (plist-get entry :patches))
-                                              0 mod-patch-recent-patches-limit))))
-            (mod-patch--update-entry orig plist))
-          ;; Mark buffer unmodified (nothing written to disk)
-          (set-buffer-modified-p nil)
-          (message "mod-patch: wrote %s" (abbreviate-file-name patch)))
-      (setq mod-patch--write-guard nil))
-    ;; Returning non-nil tells Emacs we handled the save
-    t))
+      ;; Recompute diff (desired vs new base), overwrite patch files.
+      (let ((diff-str (modpatch--generate-diff
+                       base-text desired
+                       (concat base ".orig")
+                       (concat base ".modpatch"))))
+        (dolist (pf patches)
+          (modpatch--write-string-to-file diff-str pf)))
+      (message "modpatch: patches updated for %s" base))))
 
-;;;; ---------------------------------------------------------------------
-;;;; Buffer initialisation / teardown
-;;;; ---------------------------------------------------------------------
+
+;;; Mode toggles
 
-(defun mod-patch--enable ()
-  "Helper run when `mod-patch-mode' is enabled."
-  (add-hook 'write-contents-functions #'mod-patch--write-contents-hook nil t)
-  (mod-patch--update-mode-line)
-  ;; Auto-restore last view
-  (let* ((orig (buffer-file-name))
-         (entry (mod-patch--get-entry orig)))
-    (when (eq (plist-get entry :last-mode) 'patch)
-      (let ((last (plist-get entry :last-patch)))
-        (when (and last (file-exists-p last))
-          (mod-patch--visit-patch last))))))
-
-(defun mod-patch--disable ()
-  "Helper run when `mod-patch-mode' is disabled."
-  (remove-hook 'write-contents-functions #'mod-patch--write-contents-hook t)
-  (setq mod-patch--current-mode 'original
-        mod-patch--current-patch-file nil)
-  (mod-patch--update-mode-line))
-
-;;;; ---------------------------------------------------------------------
-;;;; Interactive patch switching
-;;;; ---------------------------------------------------------------------
-
-(defun mod-patch--visit-patch (patch-file)
-  "Switch current buffer into PATCH-FILE editing mode."
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (insert-file-contents patch-file)
-    (setq buffer-read-only nil))
-  (diff-mode)
-  (setq mod-patch--current-mode 'patch
-        mod-patch--current-patch-file patch-file)
-  (mod-patch--update-mode-line)
-  ;; Remember for persistence
-  (let* ((entry (mod-patch--get-entry (buffer-file-name (or (buffer-base-buffer) (current-buffer)))))
-         (entry (plist-put entry :last-mode 'patch))
-         (entry (plist-put entry :last-patch patch-file)))
-    (mod-patch--update-entry (buffer-file-name) entry)))
-
-(defun mod-patch-switch ()
-  "Select and visit a recent patch for the current file."
+(defun modpatch-enter-rebase-mode ()
+  "Switch current buffer into 'rebase' mode:
+we now edit & save the real base file, and patch files get auto-regenerated."
   (interactive)
-  (let* ((orig (buffer-file-name))
-         (entry (mod-patch--get-entry orig))
+  (unless modpatch-mode
+    (user-error "Enable modpatch-mode first"))
+  (setq modpatch--rebase-mode-p t)
+  (add-hook 'after-save-hook #'modpatch--after-save-rebase nil t)
+  (message "modpatch: now editing base; saving will rewrite patches"))
+
+(defun modpatch-exit-rebase-mode ()
+  "Return to patch-authoring mode: saving writes patches, not the base file."
+  (interactive)
+  (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
+  (setq modpatch--rebase-mode-p nil)
+  (message "modpatch: now editing modded view; saving writes patches only"))
+
+
+;;; Auto-activation on find-file
+
+(defun modpatch--apply-all-patches-to-base (base-abs entry)
+  "Return desired text for BASE-ABS. If entry already has :desired, reuse it.
+Otherwise, apply each patch in :patches to the current base to compute it,
+store it back in :desired, and return it."
+  (let* ((desired (plist-get entry :desired))
          (patches (plist-get entry :patches)))
-    (unless patches (user-error "No patches recorded for this file"))
-    (let* ((choice (completing-read "Patch: " patches nil t)))
-      (mod-patch--visit-patch choice))))
+    (unless desired
+      (let ((tmp (modpatch--read-file-as-string base-abs)))
+        (dolist (pf patches)
+          (let ((patch-text (modpatch--read-file-as-string pf)))
+            (setq tmp (modpatch--apply-patch tmp patch-text))))
+        (setq desired tmp)
+        (setf (plist-get entry :desired) desired)
+        (modpatch--set-entry base-abs entry)))
+    desired))
 
-(defun mod-patch-toggle ()
-  "Toggle between original buffer and its last visited patch."
-  (interactive)
-  (pcase mod-patch--current-mode
-    ('original
-     (let* ((orig (buffer-file-name))
-            (entry (mod-patch--get-entry orig))
-            (last (car (plist-get entry :patches))))
-       (if (and last (file-exists-p last))
-           (mod-patch--visit-patch last)
-         (user-error "No patch to toggle to"))))
-    (_ ;; currently in patch, so go back to original
-     (revert-buffer t t t) ;; reload pristine contents
-     (diff-mode 0)
-     (setq mod-patch--current-mode 'original
-           mod-patch--current-patch-file nil)
-     (mod-patch--update-mode-line)
-     (let* ((orig (buffer-file-name))
-            (entry (mod-patch--get-entry orig)))
-       (setq entry (plist-put entry :last-mode 'original))
-       (mod-patch--update-entry orig entry)))))
+(defun modpatch-maybe-activate ()
+  "If the file we just visited has modpatch metadata, rewrite buffer contents
+to show the desired (patched) state and enable `modpatch-mode'."
+  (when buffer-file-name
+    (let* ((base (modpatch--abs buffer-file-name))
+           (entry (gethash base modpatch--table)))
+      (when entry
+        ;; Replace buffer text with desired (patched) text.
+        (let ((desired (modpatch--apply-all-patches-to-base base entry)))
+          (erase-buffer)
+          (insert desired)
+          (goto-char (point-min))
+          ;; Mark unmodified (this is our working view right now).
+          (set-buffer-modified-p nil))
+        ;; Enable modpatch-mode for this buffer.
+        (modpatch-mode 1)))))
 
-;;;; ---------------------------------------------------------------------
-;;;; Merge / conflict handling
-;;;; ---------------------------------------------------------------------
+(add-hook 'find-file-hook #'modpatch-maybe-activate)
 
-(defun mod-patch-merge-finish ()
-  "Manually merge current patch into the original and refresh."
-  (interactive)
-  (unless (and (eq mod-patch--current-mode 'patch) mod-patch--current-patch-file)
-    (user-error "Not visiting a patch buffer"))
-  (let* ((err (mod-patch--apply-patch-to-region (current-buffer)
-                                                (find-file-noselect (buffer-base-buffer)))))
-    (if err
-        (progn
-          (display-buffer err)
-          (message "mod-patch: merge failed; resolve conflicts then run again"))
-      (save-buffer) ;; save original file changes
-      (kill-buffer)
-      (message "mod-patch: merge successful"))))
+
+;;; Minor modes
 
-;;;; ---------------------------------------------------------------------
-;;;; Entry point
-;;;; ---------------------------------------------------------------------
+(defvar modpatch-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c m a") #'modpatch-add-patch-target)
+    (define-key map (kbd "C-c m r") #'modpatch-enter-rebase-mode)
+    (define-key map (kbd "C-c m R") #'modpatch-exit-rebase-mode)
+    (define-key map (kbd "C-c m s") #'modpatch-save-associations)
+    map)
+  "Keymap for `modpatch-mode'.")
 
-;;;###autoload
-(define-minor-mode mod-patch-mode
-  "Minor mode for patch-centric editing workflow."
-  :init-value nil
-  :lighter nil
-  :keymap (let ((map (make-sparse-keymap)))
-            (define-key map (kbd "C-c p t") #'mod-patch-toggle)
-            (define-key map (kbd "C-c p s") #'mod-patch-switch)
-            (define-key map (kbd "C-c p m") #'mod-patch-merge-finish)
-            map)
-  (if mod-patch-mode
-      (mod-patch--enable)
-    (mod-patch--disable)))
+(define-minor-mode modpatch-mode
+  "Minor mode to edit a file as a mod patch instead of saving it directly.
 
-;;;###autoload
-(defun mod-patch-setup-for-current-buffer ()
-  "Enable `mod-patch-mode' in the current buffer with sensible defaults."
-  (interactive)
-  (unless (buffer-file-name)
-    (user-error "Buffer has no associated file"))
-  (mod-patch--load-state)
-  (mod-patch-mode 1))
+When modpatch-mode is active and not in rebase mode:
+- The buffer is assumed to correspond to a 'base file' on disk,
+  stored in `modpatch--base-file'.
+- The visible contents are the desired modded result.
+- Saving (C-x C-s) does NOT write to the base file. Instead it
+  regenerates one or more unified diff patch files and marks the
+  buffer clean without touching the base file on disk.
+  This is implemented via `write-contents-functions', which allows a
+  buffer to say \"I handled saving myself\" and stop Emacs from
+  writing the visited file. :contentReference[oaicite:6]{index=6}
 
-;;;; ---------------------------------------------------------------------
-;;;; Multiple target-directory support
-;;;; ---------------------------------------------------------------------
+When `modpatch-enter-rebase-mode' is called:
+- We toggle `modpatch--rebase-mode-p' so that saves write the base
+  file normally, and after-save hooks recompute patches so they still
+  produce the recorded desired state.
 
-(defcustom mod-patch-known-directories nil
-  "List of user-configured patch directories.
-Each element *must* be an absolute directory path *with* a trailing slash.
-The list is persisted automatically; you rarely need to set it manually."
-  :type '(repeat directory))
+Use `modpatch-exit-rebase-mode' to switch back."
+  :lighter " ModPatch"
+  :keymap modpatch-mode-map
+  (if modpatch-mode
+      ;; enabling
+      (progn
+        (unless buffer-file-name
+          (user-error "modpatch-mode needs a file-visiting buffer"))
+        (setq modpatch--base-file (modpatch--abs buffer-file-name))
+        ;; install buffer-local write-contents-functions hook
+        (add-hook 'write-contents-functions #'modpatch--write-contents nil t))
+    ;; disabling
+    (remove-hook 'write-contents-functions #'modpatch--write-contents t)
+    (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
+    (setq modpatch--rebase-mode-p nil)))
 
-(defun mod-patch--normalise-dir (dir)
-  "Return DIR as an absolute name ending with a directory separator."
-  (file-name-as-directory (expand-file-name dir)))
+(provide 'modpatch)
 
-(defun mod-patch--remember-directory (dir)
-  "Add DIR to `mod-patch-known-directories', avoiding duplicates, and persist."
-  (setq dir (mod-patch--normalise-dir dir))
-  (unless (member dir mod-patch-known-directories)
-    (push dir mod-patch-known-directories))
-  ;; Persist alongside the ordinary state file
-  (mod-patch--save-state)
-  dir)
-
-;;;###autoload
-(defun mod-patch-add-patch-directory (dir)
-  "Interactively add DIR to the set of patch target directories.
-
-The directory is created if it does not yet exist, recorded in
-`mod-patch-known-directories', and becomes the new default
-(`mod-patch-target-directory') for the current session."
-  (interactive "DNew patch directory: ")
-  (setq dir (mod-patch--normalise-dir dir))
-  (unless (file-directory-p dir)
-    (make-directory dir t))
-  (mod-patch--remember-directory dir)
-  (setq mod-patch-target-directory dir)
-  (message "mod-patch: now using %s for new patches"
-           (abbreviate-file-name dir)))
-
-;;;; ---------------------------------------------------------------------
-;;;; Completion helper for recent *directories*
-;;;; ---------------------------------------------------------------------
-
-(defun mod-patch--completing-patch-dirs ()
-  "Return list of patch directories suitable for `completing-read'."
-  (mapcar (lambda (p)
-            ;; Show parent directory names to disambiguate similar tails.
-            (cons (abbreviate-file-name p) p))
-          mod-patch-known-directories))
-
-(provide 'mod-patch)
-;;; mod-patch.el ends here
+;;; modpatch.el ends here

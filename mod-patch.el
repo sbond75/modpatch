@@ -138,92 +138,110 @@ it returns an empty string."
 (defun modpatch--apply-patch (base-text patch-text)
   "Apply PATCH-TEXT (a unified diff) to BASE-TEXT and return the patched result.
 
-Signals an error if the patch cannot be applied cleanly.
+On success:
+  Return the merged text as a string.
+
+On failure:
+  Signal an error whose message includes:
+  - patch's diagnostic output (which hunks failed, at which lines)
+  - the contents of the reject file, if any, so you can see the failing hunks.
 
 Implementation notes:
-1. We create a temp directory D.
-2. We write BASE-TEXT into D/base.
-3. We run `patch --forward --strip=0 --input=…` from that directory.
-   --forward means: if a hunk is already applied, skip it instead of failing.
-   You can remove --forward if you want strict failure on already-applied hunks.
-4. We read back D/base and return it.
-
-We ignore the paths inside the diff headers; we force patch to operate
-on a known filename by normalizing the headers fed to patch.
-
-To do that robustly, we rewrite PATCH-TEXT so that all file headers
-(--- … / +++ …) refer to \"base\"."
+We normalize the headers in PATCH-TEXT to refer to \"base\" so we always
+apply to a known filename. Then we run `patch` in a temp directory on a
+temp file called \"base\"."
   (let* ((tmp-dir   (make-temp-file "modpatch-patchdir-" t)) ;; t => directory
          (tmp-base  (expand-file-name "base" tmp-dir))
          (tmp-patch (expand-file-name "change.patch" tmp-dir))
-         (patched-buf (generate-new-buffer " *modpatch-patched*"))
+         (rej-file  (expand-file-name "base.rej" tmp-dir))
+         (patch-buf (generate-new-buffer " *modpatch-patch-output*"))
          (status    nil)
          cleaned-patch
          result-str)
 
     (unwind-protect
         (progn
-          ;; Normalize patch headers to ensure they reference "base"
-          ;;
-          ;; Unified diff header lines look like:
-          ;;   --- oldname\tTIMESTAMP
-          ;;   +++ newname\tTIMESTAMP
-          ;;
-          ;; We rewrite both to "base".
+          ;; 1. Normalize the --- / +++ headers in PATCH-TEXT so both point to \"base\"
+          ;;    regardless of what path is encoded in the .patch file.
           (setq cleaned-patch
                 (with-temp-buffer
                   (insert patch-text)
                   (goto-char (point-min))
+                  ;; Replace file name in header lines that start with --- or +++
+                  ;; Example:
+                  ;;   --- Assets/Lua/test.lua   2025-10-26
+                  ;;   +++ Assets/Lua/test.lua   2025-10-26
+                  ;; becomes
+                  ;;   --- base
+                  ;;   +++ base
                   (while (re-search-forward
-                          "^[+-]\\{3\\}\\s-+\\([^ \t\n]+\\)" nil t)
-                    ;; Replace captured filename with "base"
-                    (replace-match "base" t t nil 1))
+                          "^[+-]\\{3\\}\\s-+\\([^ \t\n]+\\).*" nil t)
+                    (replace-match (concat (substring (match-string 0) 0 3)
+                                           " base")
+                                   t t))
                   (buffer-substring-no-properties
                    (point-min) (point-max))))
 
-          ;; Write BASE-TEXT and cleaned PATCH-TEXT to disk
+          ;; 2. Write our working files
           (with-temp-file tmp-base
             (insert base-text))
           (with-temp-file tmp-patch
             (insert cleaned-patch))
 
-          ;; Call patch
+          ;; 3. Run patch
           ;;
-          ;; --silent: reduce noise
-          ;; --forward: don't fail if hunks already applied (optional; remove if unwanted)
-          ;; --strip=0: do not strip leading components (we forced file name to "base")
+          ;;   We run `patch` in tmp-dir so that relative filename \"base\" is found.
+          ;;   We don't use --silent, because we *want* hunk failure diagnostics.
+          ;;   We *do* use --batch to avoid interactive prompts.
+          ;;   We *do* use --reject-file=base.rej to ensure reject hunks land in tmp-dir.
           ;;
-          ;; We run patch with `default-directory` = tmp-dir so it finds "base".
           (let ((default-directory tmp-dir))
             (setq status
                   (call-process
-                   "patch" nil patched-buf nil
-                   "--silent" "--forward" "--strip=0"
-                   "--input" tmp-patch "base")))
+                   "patch" nil patch-buf nil
+                   "--batch"
+                   (concat "--reject-file=" rej-file)
+                   "--strip=0"
+                   "--input" tmp-patch
+                   "base")))
 
-          (unless (eq status 0)
-            (with-current-buffer patched-buf
-              (let ((err-output
-                     (buffer-substring-no-properties
-                      (point-min) (point-max))))
-                (error "modpatch--apply-patch: patch failed (%s): %s"
-                       status err-output))))
-
-          ;; Read back the updated file
-          (setq result-str
-                (modpatch--read-file-as-string tmp-base))
+          (if (eq status 0)
+              ;; success: read out the new \"base\"
+              (setq result-str
+                    (modpatch--read-file-as-string tmp-base))
+            ;; failure: gather diagnostics and raise
+            (let* ((patch-output
+                    (with-current-buffer patch-buf
+                      (buffer-substring-no-properties
+                       (point-min) (point-max))))
+                   (rej-contents
+                    (when (file-readable-p rej-file)
+                      (modpatch--read-file-as-string rej-file)))
+                   (err-msg
+                    (concat
+                     "patch failed with exit code " (number-to-string status) "\n"
+                     "---- patch output ----\n"
+                     patch-output
+                     (when rej-contents
+                       (concat
+                        "\n---- reject hunks (base.rej) ----\n"
+                        rej-contents
+                        "\n")))))
+              (error "modpatch--apply-patch: %s" err-msg)))
 
           result-str)
+
       ;; cleanup
       (when (and tmp-base (file-exists-p tmp-base))
         (ignore-errors (delete-file tmp-base)))
       (when (and tmp-patch (file-exists-p tmp-patch))
         (ignore-errors (delete-file tmp-patch)))
+      (when (and rej-file (file-exists-p rej-file))
+        (ignore-errors (delete-file rej-file)))
       (when (and tmp-dir (file-exists-p tmp-dir))
-        ;; delete-directory with recursive = t
         (ignore-errors (delete-directory tmp-dir t)))
-      (when (buffer-live-p patched-buf)
-        (kill-buffer patched-buf)))))
+      (when (buffer-live-p patch-buf)
+        (kill-buffer patch-buf)))))
 
 
 ;;; Internal: look up and update association entries

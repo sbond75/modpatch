@@ -229,30 +229,59 @@ To do that robustly, we rewrite PATCH-TEXT so that all file headers
 ;;; Internal: look up and update association entries
 
 (defun modpatch--get-entry (base-abs)
+  "Return the association plist for BASE-ABS, creating one if needed."
   (or (gethash base-abs modpatch--table)
-      (let ((entry (list :patches nil :desired nil)))
+      (let ((entry (list :patches nil)))
         (puthash base-abs entry modpatch--table)
         entry)))
 
 (defun modpatch--set-entry (base-abs entry)
+  "Replace the association plist for BASE-ABS with ENTRY."
   (puthash base-abs entry modpatch--table))
 
+(defun modpatch--find-patch-record (entry patch-file)
+  "Return the patch record plist in ENTRY for PATCH-FILE, or nil."
+  (cl-find patch-file (plist-get entry :patches)
+           :key (lambda (rec) (plist-get rec :file))
+           :test #'string-equal))
+
+(defun modpatch--ensure-patch-record (entry patch-file)
+  "Return (ENTRY' . RECORD) where RECORD is the patch record for PATCH-FILE.
+If no record existed, create one with :file PATCH-FILE and :desired nil,
+append it to ENTRY's :patches, and return the updated ENTRY and new record."
+  (let* ((patch-file-abs (expand-file-name patch-file))
+         (patches (plist-get entry :patches))
+         (record (modpatch--find-patch-record entry patch-file-abs)))
+    (unless record
+      (setq record (list :file patch-file-abs :desired nil))
+      (setq patches (append patches (list record)))
+      (setf (plist-get entry :patches) patches))
+    (cons entry record)))
+
 (defun modpatch-add-patch-target (patch-file)
-  "Interactively add PATCH-FILE as a patch target for the current buffer's base."
+  "Associate PATCH-FILE with this buffer's base file and make it active.
+
+PATCH-FILE is recorded in the global table. The current buffer's
+contents become that patch's :desired immediately, and future saves
+in patch-authoring mode will update only this PATCH-FILE."
   (interactive "FAdd patch file: ")
   (unless (bound-and-true-p modpatch--base-file)
     (user-error "Not in modpatch context"))
+
   (let* ((base modpatch--base-file)
-         (abs (modpatch--abs patch-file))
+         (abs  (expand-file-name patch-file))
          (entry (modpatch--get-entry base))
-         (plist (copy-sequence entry))
-         (targets (plist-get plist :patches)))
-    (unless (member abs targets)
-      (setq targets (append targets (list abs))))
-    (setf (plist-get plist :patches) targets)
-    (modpatch--set-entry base plist)
+         (pair (modpatch--ensure-patch-record entry abs))
+         (entry* (car pair))
+         (record (cdr pair))
+         (desired-now (buffer-substring-no-properties (point-min) (point-max))))
+    ;; Update record's :desired to current buffer text.
+    (setf (plist-get record :desired) desired-now)
+    ;; Save back
+    (modpatch--set-entry base entry*)
+    (setq modpatch--active-patch-file abs)
     (modpatch-save-associations)
-    (message "Added patch target %s" abs)))
+    (message "Added and activated patch target %s" abs)))
 
 
 ;;; Buffer-local state
@@ -264,34 +293,53 @@ To do that robustly, we rewrite PATCH-TEXT so that all file headers
   "Non-nil if this buffer is editing the true base on disk (modpatch-rebase-mode).
 In that case we let Emacs save normally, then regenerate patches after save.")
 
+(defvar-local modpatch--base-file nil
+  "Absolute path of the base file for this buffer.")
+
+(defvar-local modpatch--active-patch-file nil
+  "Absolute path of the patch file this buffer is currently editing.")
+
+(defvar-local modpatch--rebase-mode-p nil
+  "Non-nil if this buffer is in rebase mode (editing the real base file).")
+
 
 ;;; Core save interception for patch mode
 
 (defun modpatch--write-contents ()
-  "Intercept save in modpatch authoring mode and write only the active patch."
+  "Buffer-local hook for `write-contents-functions`.
+
+If we are in modpatch-mode and not in rebase mode:
+- Compute a unified diff between the on-disk base file and the current buffer.
+- Write that diff only to the active patch file.
+- Update that patch record's :desired.
+- Mark buffer unmodified and report success to Emacs.
+
+Return non-nil to tell Emacs that the save was fully handled."
   (when (and modpatch-mode (not modpatch--rebase-mode-p))
-    (let* ((base         modpatch--base-file)
-           (entry        (modpatch--get-entry base))
-           (patches      (plist-get entry :patches))
-           (active       (modpatch--ensure-active-patch base entry))
+    (unless modpatch--active-patch-file
+      (user-error "No active patch file for this buffer. Use modpatch-add-patch-target or modpatch-switch-to-patch-target."))
+    (let* ((base modpatch--base-file)
+           (active-patch modpatch--active-patch-file)
+           (entry (modpatch--get-entry base))
+           (pair (modpatch--ensure-patch-record entry active-patch))
+           (entry* (car pair))
+           (record (cdr pair))
+           ;; Texts
            (base-text    (modpatch--read-file-as-string base))
-           ;; Context = base with all *other* patches applied.
-           (context-text (modpatch--apply-patches-except base-text patches active))
-           ;; What the user wants overall (this buffer’s current text).
-           (desired-text (buffer-substring-no-properties (point-min) (point-max))))
-      ;; Update :desired (the combined target state).
-      (let ((new-entry (copy-sequence entry)))
-        (setf (plist-get new-entry :desired) desired-text)
-        (modpatch--set-entry base new-entry))
-
-      ;; Diff only the delta owned by ACTIVE: context -> desired
-      (let ((diff-str (modpatch--generate-diff
-                       context-text desired-text
-                       (concat base ".context")
-                       (concat active ".modpatch"))))
-        (modpatch--write-string-to-file diff-str active))
-
+           (desired-text (buffer-substring-no-properties (point-min) (point-max)))
+           ;; Create diff for only this patch
+           (diff-str (modpatch--generate-diff
+                      base-text desired-text
+                      (concat base ".orig")
+                      (concat base ".modpatch"))))
+      ;; Write the diff to just the active patch file
+      (modpatch--write-string-to-file diff-str active-patch)
+      ;; Update this patch record's :desired
+      (setf (plist-get record :desired) desired-text)
+      ;; Save updated entry back and persist
+      (modpatch--set-entry base entry*)
       (modpatch-save-associations)
+      ;; Mark buffer clean for Emacs
       (set-buffer-modified-p nil)
       t)))
 
@@ -299,27 +347,34 @@ In that case we let Emacs save normally, then regenerate patches after save.")
 ;;; After-save hook for rebase mode
 
 (defun modpatch--after-save-rebase ()
-  "After saving the true base file on disk, regenerate each patch independently."
+  "After saving the true base file on disk, regenerate every patch file.
+
+For each patch record:
+- We diff the new base file text on disk vs that record's :desired.
+- We rewrite that patch file with the new diff.
+
+This keeps all patch files aligned with upstream edits made in rebase mode."
   (when (and modpatch-mode modpatch--rebase-mode-p)
-    (let* ((base      modpatch--base-file)
-           (entry     (modpatch--get-entry base))
-           (patches   (plist-get entry :patches))
-           (base-text (modpatch--read-file-as-string base))
-           ;; Ensure we have the intended overall target: prefer cached :desired,
-           ;; otherwise reconstruct from current on-disk patches.
-           (desired   (or (plist-get entry :desired)
-                          (modpatch--apply-all-patches-to-base base entry t))))
-      ;; For each patch Pi, write the delta from (base + all Pj!=i) -> desired.
-      (dolist (pf patches)
-        (let* ((context (modpatch--apply-patches-except base-text patches pf))
-               (diff    (modpatch--generate-diff
-                         context desired
-                         (concat base ".context")
-                         (concat pf ".modpatch"))))
-          (modpatch--write-string-to-file diff pf)))
-      ;; Keep :desired authoritative (it already is if present; if rebuilt above,
-      ;; apply-all-patches-to-base updated and persisted it).
-      (message "modpatch: patches updated for %s (independently)" base))))
+    (let* ((base modpatch--base-file)
+           (entry (modpatch--get-entry base))
+           (patches (plist-get entry :patches))
+           (base-text (modpatch--read-file-as-string base)))
+      (dolist (rec patches)
+        (let* ((patch-file (plist-get rec :file))
+               (desired    (plist-get rec :desired)))
+          (unless desired
+            ;; If a patch record has no :desired yet, skip it. We have nothing
+            ;; to preserve for this patch.
+            (cl-return))
+          (let ((diff-str (modpatch--generate-diff
+                           base-text desired
+                           (concat base ".orig")
+                           (concat base ".modpatch"))))
+            (modpatch--write-string-to-file diff-str patch-file))))
+      ;; After we’ve rewritten all patch files, we could optionally refresh
+      ;; each record's :desired from disk, but it's not strictly required here.
+      (modpatch-save-associations)
+      (message "modpatch: all patches updated for %s" base))))
 
 
 
@@ -328,67 +383,63 @@ In that case we let Emacs save normally, then regenerate patches after save.")
 (defun modpatch-enter-rebase-mode ()
   "Switch current buffer into rebase mode.
 
-Steps:
-1. Capture/commit the current desired modded view so it is not lost.
-   This updates the association entry's :desired and rewrites patch files.
-2. Load the true on-disk base file contents into the buffer.
-3. Enable after-save hook so that future saves rewrite patches.
+Process:
+1. For the active patch: run the patch-authoring save logic so its
+   :desired and its .patch file are up to date with the current buffer.
+2. Replace buffer contents with the real on-disk base file.
+3. Enable after-save hook that updates all patches whenever you save.
 
-After this call, the buffer is literally the base file on disk.
-Saving (C-x C-s) writes the base file, then patches are recalculated."
+After this call, you are looking at the true base file on disk."
   (interactive)
   (unless modpatch-mode
     (user-error "Enable modpatch-mode first"))
   (when modpatch--rebase-mode-p
     (user-error "Already in rebase mode"))
 
-  ;; Step 1: commit desired state and refresh patch files.
-  ;; We reuse the same logic as `modpatch--write-contents`, but we call it
-  ;; directly instead of going through save-buffer. The hook returns non-nil
-  ;; to indicate it 'handled' the save. We don't care about that here.
+  ;; Step 1: flush current buffer changes into the active patch record and file.
   (modpatch--write-contents)
 
-  ;; Step 2: replace buffer text with the true base file on disk.
+  ;; Step 2: show actual base on disk.
   (let* ((base modpatch--base-file)
          (base-text (modpatch--read-file-as-string base)))
     (modpatch--replace-buffer-with-text base-text))
 
-  ;; Step 3: flip mode state to rebase mode and install after-save hook.
+  ;; Step 3: mark rebase mode and install after-save hook.
   (setq modpatch--rebase-mode-p t)
   (add-hook 'after-save-hook #'modpatch--after-save-rebase nil t)
 
-  (message "modpatch: now editing base on disk; saving updates base, then rewrites patches"))
+  (message "modpatch: now editing base on disk; saving updates base, then rewrites all patches"))
 
 (defun modpatch-exit-rebase-mode ()
   "Leave rebase mode and return to patch-authoring mode.
 
+We restore the buffer to reflect the currently active patch file's
+view of the base file.
+
 Steps:
-1. Recompute the patched (desired) view from disk, forcing use of the
-   latest patch files rather than any cached :desired.
-2. Replace the buffer text with that desired view.
-3. Remove rebase hooks and go back to patch-authoring semantics
-   (saving writes patch files, not the base file)."
+1. Force recompute desired text for the active patch from disk
+   (using the latest .patch file) against the current base file.
+2. Replace buffer contents with that desired text.
+3. Disable the after-save hook and mark rebase-mode off."
   (interactive)
   (unless modpatch-mode
     (user-error "modpatch-mode is not active"))
   (unless modpatch--rebase-mode-p
     (user-error "Not currently in rebase mode"))
+  (unless modpatch--active-patch-file
+    (user-error "No active patch file to restore"))
 
   (let* ((base modpatch--base-file)
-         (entry (modpatch--get-entry base))
-         ;; Force recompute so we read the newest .patch contents
-         ;; that were regenerated during rebase-mode saves.
-         (desired (modpatch--apply-all-patches-to-base base entry t)))
-    ;; Put that desired (patched) view into the buffer so that
-    ;; from this point forward, we are again editing the modded view
-    ;; instead of the literal on-disk base file.
+         (desired (modpatch--desired-for-patch
+                   base modpatch--active-patch-file t)))
     (modpatch--replace-buffer-with-text desired))
 
-  ;; Drop after-save hook. We are no longer editing the real base file.
+  ;; Disable rebase behavior.
   (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
   (setq modpatch--rebase-mode-p nil)
 
-  (message "modpatch: now editing modded view; saving writes patches only"))
+  (message "modpatch: now editing only patch %s; saving updates that patch"
+           modpatch--active-patch-file))
 
 
 ;;; Auto-activation on find-file
@@ -428,15 +479,24 @@ same state."
     desired))
 
 (defun modpatch-maybe-activate ()
-  "If visiting a file with modpatch metadata, replace buffer contents
-with the patched view and enable modpatch-mode."
+  "If visiting a tracked base file, show the desired state for the first patch
+and enable modpatch-mode. Does nothing if the file is unknown or has no patches."
   (when buffer-file-name
-    (let* ((base (modpatch--abs buffer-file-name))
+    (let* ((base (expand-file-name buffer-file-name))
            (entry (gethash base modpatch--table)))
       (when entry
-        (let ((desired (modpatch--apply-all-patches-to-base base entry)))
-          (modpatch--replace-buffer-with-text desired))
-        (modpatch-mode 1)))))
+        (let* ((patches (plist-get entry :patches)))
+          (when (null patches)
+            ;; No patches registered: nothing to activate.
+            (cl-return-from modpatch-maybe-activate))
+          (let* ((first-rec (car patches))
+                 (patch-file (plist-get first-rec :file))
+                 ;; Force recompute so buffer reflects latest .patch on disk.
+                 (desired (modpatch--desired-for-patch base patch-file t)))
+            (modpatch--replace-buffer-with-text desired)
+            (setq modpatch--base-file base)
+            (setq modpatch--active-patch-file patch-file)
+            (modpatch-mode 1)))))))
 
 (add-hook 'find-file-hook #'modpatch-maybe-activate)
 
@@ -446,6 +506,7 @@ with the patched view and enable modpatch-mode."
 (defvar modpatch-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-c m a") #'modpatch-add-patch-target)
+    (define-key map (kbd "C-c m p") #'modpatch-switch-to-patch-target)
     (define-key map (kbd "C-c m r") #'modpatch-enter-rebase-mode)
     (define-key map (kbd "C-c m R") #'modpatch-exit-rebase-mode)
     (define-key map (kbd "C-c m s") #'modpatch-save-associations)
@@ -512,65 +573,73 @@ Signals an error if not in modpatch-mode or no association exists."
       patches)))
 
 
+(defun modpatch--all-patch-files-for-base (base-abs)
+  "Return list of patch file paths associated with BASE-ABS."
+  (let* ((entry (gethash base-abs modpatch--table)))
+    (unless entry
+      (user-error "No modpatch entry for %s" base-abs))
+    (mapcar (lambda (rec) (plist-get rec :file))
+            (plist-get entry :patches))))
+
 (defun modpatch-switch-to-patch-target ()
-  "Prompt for one of the associated patch files and visit it.
-Also sets that patch as the :active patch for this base."
-  (interactive)
-  (let* ((patches (modpatch--patch-targets-for-current-buffer))
-         (choice (if (= (length patches) 1)
-                     (car patches)
-                   (completing-read "Switch to patch file: " patches
-                                    nil t nil nil (car patches))))
-         (base   modpatch--base-file)
-         (entry  (modpatch--get-entry base)))
-    (setf (plist-get entry :active) choice)
-    (modpatch--set-entry base entry)
-    (modpatch-save-associations)
-    (find-file choice)))
+  "Pick one of the associated patch files and make it active in this buffer.
 
-;; In the association plist for a base file, we now support:
-;; :patches  -> list of patch file paths (strings)
-;; :desired  -> string (the combined desired end state)
-;; :active   -> string or nil (path of the currently active patch)
+After selection:
+1. The buffer becomes that patch's desired state.
+2. Future saves will update only that one patch file.
+3. Other patches are untouched.
 
-(defun modpatch--ensure-active-patch (base-abs entry)
-  "Ensure ENTRY has a valid :active patch. If not, prompt or auto-pick.
-Return the active patch path string (also persisted)."
-  (let* ((patches (plist-get entry :patches))
-         (active  (plist-get entry :active)))
-    (unless patches
-      (user-error "No patch targets are registered for %s" base-abs))
-    (unless (and active (member active patches))
-      (setq active
-            (if (= (length patches) 1)
-                (car patches)
-              (completing-read "Active patch for this file: " patches nil t
-                               nil nil (car patches))))
-      (setf (plist-get entry :active) active)
-      (modpatch--set-entry base-abs entry)
-      (modpatch-save-associations))
-    active))
-
-(defun modpatch-set-active-patch ()
-  "Interactively set the active patch for the current base-file buffer."
+This does not enter or exit rebase mode; it just changes which patch
+you're working on."
   (interactive)
   (unless (and (bound-and-true-p modpatch-mode)
                (bound-and-true-p modpatch--base-file))
-    (user-error "Not in modpatch-mode for a tracked base file"))
-  (let* ((base modpatch--base-file)
-         (entry (modpatch--get-entry base)))
-    (modpatch--ensure-active-patch base entry) ; will prompt if needed
-    (message "Active patch is now: %s" (plist-get entry :active))))
+    (user-error "Not in modpatch-mode on a tracked base file"))
 
-(defun modpatch--apply-patches-except (base-text patch-files except-path)
-  "Apply PATCH-FILES (unified diffs) in order to BASE-TEXT, skipping EXCEPT-PATH.
-Return the resulting text."
-  (let ((txt base-text))
-    (dolist (pf patch-files)
-      (unless (and except-path (equal pf except-path))
-        (let ((patch-text (modpatch--read-file-as-string pf)))
-          (setq txt (modpatch--apply-patch txt patch-text)))))
-    txt))
+  (let* ((base modpatch--base-file)
+         (patches (modpatch--all-patch-files-for-base base))
+         (choice (cond
+                  ((null patches)
+                   (user-error "No patch targets registered for %s" base))
+                  ((= (length patches) 1)
+                   (car patches))
+                  (t
+                   (completing-read
+                    "Activate patch: " patches nil t nil nil (car patches))))))
+    ;; Compute / load desired for this patch, force recompute from disk
+    ;; to ensure it's up to date with the .patch file as it exists now.
+    (let ((desired (modpatch--desired-for-patch base choice t)))
+      (modpatch--replace-buffer-with-text desired))
+    ;; Mark active patch
+    (setq modpatch--active-patch-file (expand-file-name choice))
+    (message "modpatch: now editing patch %s" modpatch--active-patch-file)))
+
+(defun modpatch--desired-for-patch (base-abs patch-file &optional force-recompute)
+  "Return the desired (patched) text for PATCH-FILE on BASE-ABS.
+
+If FORCE-RECOMPUTE is non-nil, ignore any cached :desired and
+recompute by applying PATCH-FILE from disk to the current on-disk
+base file.
+
+Otherwise reuse the :desired cached in the patch record if present.
+
+Always updates the patch record's :desired in `modpatch--table` and
+saves associations."
+  (let* ((entry (modpatch--get-entry base-abs))
+         (pair (modpatch--ensure-patch-record entry patch-file))
+         (entry* (car pair))
+         (record (cdr pair))
+         (desired (plist-get record :desired)))
+    (when (or force-recompute (null desired))
+      (let* ((base-text  (modpatch--read-file-as-string base-abs))
+             (patch-text (modpatch--read-file-as-string (plist-get record :file)))
+             (rebuilt    (modpatch--apply-patch base-text patch-text)))
+        (setq desired rebuilt)
+        (setf (plist-get record :desired) desired)))
+    ;; write back updated entry to table and persist
+    (modpatch--set-entry base-abs entry*)
+    (modpatch-save-associations)
+    (plist-get record :desired)))
 
 (provide 'modpatch)
 

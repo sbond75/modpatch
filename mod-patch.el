@@ -508,6 +508,45 @@ and mark buffer unmodified."
     (goto-char (point-min))
     (set-buffer-modified-p nil)))
 
+(defun modpatch--patch-targets-for-current-buffer ()
+  "Return the list of patch file paths associated with this buffer's base file.
+Signals an error if not in modpatch-mode or no association exists."
+  (unless (and (bound-and-true-p modpatch-mode)
+               (bound-and-true-p modpatch--base-file))
+    (user-error "Not in modpatch-mode for a tracked base file"))
+  (let* ((base modpatch--base-file)
+         (entry (gethash base modpatch--table)))
+    (unless entry
+      (user-error "No modpatch association found for %s" base))
+    (let ((patches (plist-get entry :patches)))
+      (unless patches
+        (user-error "No patch targets are registered for %s" base))
+      patches)))
+
+
+(defun modpatch-switch-to-patch-target ()
+  "Prompt for one of the associated patch files for this base file
+and visit it in the current window.
+
+This is a convenience for quickly editing the patch file itself.
+
+Usage:
+- Call from a buffer in `modpatch-mode`.
+- You will be offered all patch files recorded in :patches for this base.
+- After choosing, the selected patch file is opened with `find-file`.
+
+Note: This does not change which patch file is \"active\" for saving.
+`modpatch-mode` will continue to regenerate every registered patch file
+on save. This command only switches your view to edit one specific
+patch file directly."
+  (interactive)
+  (let* ((patches (modpatch--patch-targets-for-current-buffer))
+         (choice (if (= (length patches) 1)
+                     (car patches)
+                   (completing-read "Switch to patch file: " patches
+                                    nil t nil nil (car patches)))))
+    (find-file choice)))
+
 (provide 'modpatch)
 
 ;;; modpatch.el ends here

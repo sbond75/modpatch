@@ -69,19 +69,161 @@
 ;;; Patch / diff primitives (stubs you must finish)
 
 (defun modpatch--generate-diff (base-text new-text base-name new-name)
-  "Return unified diff string that would transform BASE-TEXT into NEW-TEXT.
-BASE-NAME and NEW-NAME are just labels that will appear in the diff headers."
-  ;; Simplest approach: write both to temp files, call external diff -u.
-  ;; You must implement this for your platform.
-  (error "modpatch--generate-diff: not implemented"))
+  "Return a unified diff string transforming BASE-TEXT into NEW-TEXT.
+
+BASE-NAME and NEW-NAME are filename labels used in the diff headers;
+they do not have to be real files on disk, but they improve readability.
+
+This function writes BASE-TEXT and NEW-TEXT to two temp files, calls
+external `diff -u`, and returns its stdout. If there are no changes,
+it returns an empty string."
+  (let* ((tmp-base  (make-temp-file "modpatch-base-"))
+         (tmp-new   (make-temp-file "modpatch-new-"))
+         (diff-buf  (generate-new-buffer " *modpatch-diff*"))
+         (status    nil)
+         diff-str)
+    (unwind-protect
+        (progn
+          ;; Write temp files
+          (with-temp-file tmp-base
+            (insert base-text))
+          (with-temp-file tmp-new
+            (insert new-text))
+
+          ;; Call diff:
+          ;;
+          ;; We ask diff to pretend that the files are BASE-NAME and NEW-NAME
+          ;; in the headers with the --label option. This produces stable,
+          ;; cleaner patch headers instead of leaking temp file paths.
+          ;;
+          ;; diff exits 0 if no differences, 1 if differences, >1 on error.
+          ;;
+          (setq status
+                (call-process
+                 "diff" nil diff-buf nil
+                 "-u"
+                 (concat "--label=" base-name)
+                 (concat "--label=" new-name)
+                 tmp-base tmp-new))
+
+          (cond
+           ((or (eq status 0) (eq status 1))
+            ;; status 0 => identical, diff is empty
+            ;; status 1 => files differ, diff printed
+            (with-current-buffer diff-buf
+              (setq diff-str
+                    (buffer-substring-no-properties
+                     (point-min) (point-max)))))
+
+           (t
+            (with-current-buffer diff-buf
+              (let ((err-output
+                     (buffer-substring-no-properties
+                      (point-min) (point-max))))
+                (error "modpatch--generate-diff: diff failed (%s): %s"
+                       status err-output)))))
+
+          ;; If files were identical, diff-str will be nil – normalize to "".
+          (or diff-str ""))
+      ;; cleanup
+      (when (and tmp-base (file-exists-p tmp-base))
+        (ignore-errors (delete-file tmp-base)))
+      (when (and tmp-new (file-exists-p tmp-new))
+        (ignore-errors (delete-file tmp-new)))
+      (when (buffer-live-p diff-buf)
+        (kill-buffer diff-buf)))))
+
+
 
 (defun modpatch--apply-patch (base-text patch-text)
   "Apply PATCH-TEXT (a unified diff) to BASE-TEXT and return the patched result.
-Signal an error if patch cannot be applied cleanly."
-  ;; Simplest approach: write BASE-TEXT to tmp file A, run `patch` with PATCH-TEXT
-  ;; into tmp file B, read B back. Or call into `epatch-buffer` in a temp buffer.
-  ;; See Emacs commands `epatch-buffer` / `diff-apply-hunk`. :contentReference[oaicite:4]{index=4}
-  (error "modpatch--apply-patch: not implemented"))
+
+Signals an error if the patch cannot be applied cleanly.
+
+Implementation notes:
+1. We create a temp directory D.
+2. We write BASE-TEXT into D/base.
+3. We run `patch --forward --strip=0 --input=…` from that directory.
+   --forward means: if a hunk is already applied, skip it instead of failing.
+   You can remove --forward if you want strict failure on already-applied hunks.
+4. We read back D/base and return it.
+
+We ignore the paths inside the diff headers; we force patch to operate
+on a known filename by normalizing the headers fed to patch.
+
+To do that robustly, we rewrite PATCH-TEXT so that all file headers
+(--- … / +++ …) refer to \"base\"."
+  (let* ((tmp-dir   (make-temp-file "modpatch-patchdir-" t)) ;; t => directory
+         (tmp-base  (expand-file-name "base" tmp-dir))
+         (tmp-patch (expand-file-name "change.patch" tmp-dir))
+         (patched-buf (generate-new-buffer " *modpatch-patched*"))
+         (status    nil)
+         cleaned-patch
+         result-str)
+
+    (unwind-protect
+        (progn
+          ;; Normalize patch headers to ensure they reference "base"
+          ;;
+          ;; Unified diff header lines look like:
+          ;;   --- oldname\tTIMESTAMP
+          ;;   +++ newname\tTIMESTAMP
+          ;;
+          ;; We rewrite both to "base".
+          (setq cleaned-patch
+                (with-temp-buffer
+                  (insert patch-text)
+                  (goto-char (point-min))
+                  (while (re-search-forward
+                          "^[+-]\\{3\\}\\s-+\\([^ \t\n]+\\)" nil t)
+                    ;; Replace captured filename with "base"
+                    (replace-match "base" t t nil 1))
+                  (buffer-substring-no-properties
+                   (point-min) (point-max))))
+
+          ;; Write BASE-TEXT and cleaned PATCH-TEXT to disk
+          (with-temp-file tmp-base
+            (insert base-text))
+          (with-temp-file tmp-patch
+            (insert cleaned-patch))
+
+          ;; Call patch
+          ;;
+          ;; --silent: reduce noise
+          ;; --forward: don't fail if hunks already applied (optional; remove if unwanted)
+          ;; --strip=0: do not strip leading components (we forced file name to "base")
+          ;;
+          ;; We run patch with `default-directory` = tmp-dir so it finds "base".
+          (let ((default-directory tmp-dir))
+            (setq status
+                  (call-process
+                   "patch" nil patched-buf nil
+                   "--silent" "--forward" "--strip=0"
+                   "--input" tmp-patch "base")))
+
+          (unless (eq status 0)
+            (with-current-buffer patched-buf
+              (let ((err-output
+                     (buffer-substring-no-properties
+                      (point-min) (point-max))))
+                (error "modpatch--apply-patch: patch failed (%s): %s"
+                       status err-output))))
+
+          ;; Read back the updated file
+          (setq result-str
+                (modpatch--read-file-as-string tmp-base))
+
+          result-str)
+      ;; cleanup
+      (when (and tmp-base (file-exists-p tmp-base))
+        (ignore-errors (delete-file tmp-base)))
+      (when (and tmp-patch (file-exists-p tmp-patch))
+        (ignore-errors (delete-file tmp-patch)))
+      (when (and tmp-dir (file-exists-p tmp-dir))
+        ;; delete-directory with recursive = t
+        (ignore-errors (delete-directory tmp-dir t)))
+      (when (buffer-live-p patched-buf)
+        (kill-buffer patched-buf)))))
 
 
 ;;; Internal: look up and update association entries
@@ -187,20 +329,67 @@ Return non-nil to tell Emacs the save is handled. :contentReference[oaicite:5]{i
 ;;; Mode toggles
 
 (defun modpatch-enter-rebase-mode ()
-  "Switch current buffer into 'rebase' mode:
-we now edit & save the real base file, and patch files get auto-regenerated."
+  "Switch current buffer into rebase mode.
+
+Steps:
+1. Capture/commit the current desired modded view so it is not lost.
+   This updates the association entry's :desired and rewrites patch files.
+2. Load the true on-disk base file contents into the buffer.
+3. Enable after-save hook so that future saves rewrite patches.
+
+After this call, the buffer is literally the base file on disk.
+Saving (C-x C-s) writes the base file, then patches are recalculated."
   (interactive)
   (unless modpatch-mode
     (user-error "Enable modpatch-mode first"))
+  (when modpatch--rebase-mode-p
+    (user-error "Already in rebase mode"))
+
+  ;; Step 1: commit desired state and refresh patch files.
+  ;; We reuse the same logic as `modpatch--write-contents`, but we call it
+  ;; directly instead of going through save-buffer. The hook returns non-nil
+  ;; to indicate it 'handled' the save. We don't care about that here.
+  (modpatch--write-contents)
+
+  ;; Step 2: replace buffer text with the true base file on disk.
+  (let* ((base modpatch--base-file)
+         (base-text (modpatch--read-file-as-string base)))
+    (modpatch--replace-buffer-with-text base-text))
+
+  ;; Step 3: flip mode state to rebase mode and install after-save hook.
   (setq modpatch--rebase-mode-p t)
   (add-hook 'after-save-hook #'modpatch--after-save-rebase nil t)
-  (message "modpatch: now editing base; saving will rewrite patches"))
+
+  (message "modpatch: now editing base on disk; saving updates base, then rewrites patches"))
 
 (defun modpatch-exit-rebase-mode ()
-  "Return to patch-authoring mode: saving writes patches, not the base file."
+  "Leave rebase mode and return to patch-authoring mode.
+
+Steps:
+1. Make sure the association table still has a correct :desired.
+   If :desired is missing we recompute it by applying all patches to
+   the current on-disk base file.
+2. Replace the buffer text with that desired (patched) view.
+3. Remove the after-save hook and mark this buffer as patch-authoring,
+   so saving regenerates patch files instead of touching the base file."
   (interactive)
+  (unless modpatch-mode
+    (user-error "modpatch-mode is not active"))
+  (unless modpatch--rebase-mode-p
+    (user-error "Not currently in rebase mode"))
+
+  (let* ((base modpatch--base-file)
+         (entry (modpatch--get-entry base))
+         ;; Ensure :desired is populated/consistent.
+         (desired
+          (modpatch--apply-all-patches-to-base base entry)))
+    ;; Step 2: restore buffer to desired content.
+    (modpatch--replace-buffer-with-text desired))
+
+  ;; Step 3: leave rebase mode.
   (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
   (setq modpatch--rebase-mode-p nil)
+
   (message "modpatch: now editing modded view; saving writes patches only"))
 
 
@@ -223,20 +412,14 @@ store it back in :desired, and return it."
     desired))
 
 (defun modpatch-maybe-activate ()
-  "If the file we just visited has modpatch metadata, rewrite buffer contents
-to show the desired (patched) state and enable `modpatch-mode'."
+  "If visiting a file with modpatch metadata, replace buffer contents
+with the patched view and enable modpatch-mode."
   (when buffer-file-name
     (let* ((base (modpatch--abs buffer-file-name))
            (entry (gethash base modpatch--table)))
       (when entry
-        ;; Replace buffer text with desired (patched) text.
         (let ((desired (modpatch--apply-all-patches-to-base base entry)))
-          (erase-buffer)
-          (insert desired)
-          (goto-char (point-min))
-          ;; Mark unmodified (this is our working view right now).
-          (set-buffer-modified-p nil))
-        ;; Enable modpatch-mode for this buffer.
+          (modpatch--replace-buffer-with-text desired))
         (modpatch-mode 1)))))
 
 (add-hook 'find-file-hook #'modpatch-maybe-activate)
@@ -287,6 +470,15 @@ Use `modpatch-exit-rebase-mode' to switch back."
     (remove-hook 'write-contents-functions #'modpatch--write-contents t)
     (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
     (setq modpatch--rebase-mode-p nil)))
+
+(defun modpatch--replace-buffer-with-text (text)
+  "Replace entire buffer contents with TEXT, keeping point at start,
+and mark buffer unmodified."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert text)
+    (goto-char (point-min))
+    (set-buffer-modified-p nil)))
 
 (provide 'modpatch)
 

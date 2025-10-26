@@ -265,27 +265,87 @@ Return the possibly-updated ENTRY and the record."
 (defun modpatch-add-patch-target (patch-file)
   "Associate PATCH-FILE with this buffer's base file and make it active.
 
-PATCH-FILE is recorded in the global table. The current buffer's
-contents become that patch's :desired immediately, and future saves
-in patch-authoring mode will update only this PATCH-FILE."
+Behavior:
+- If PATCH-FILE already exists and is non-empty (a real .patch you've created
+  elsewhere or in a previous session), we import it:
+  1. Read the on-disk base file.
+  2. Apply PATCH-FILE to that base (modpatch--apply-patch).
+  3. Store that result as :desired, and store the current base text as :base-ref.
+  4. Put that desired text into the current buffer so you are now editing that
+     patch's modded view.
+
+- If PATCH-FILE does not exist or is empty, we treat the CURRENT BUFFER CONTENTS
+  as the desired state for this patch and initialize the patch file accordingly.
+
+In either case:
+- The patch record is created/updated in the global table.
+- The chosen PATCH-FILE becomes the active patch for this buffer.
+- Future saves in normal modpatch-mode will ONLY update this one patch file."
   (interactive "FAdd patch file: ")
   (unless (bound-and-true-p modpatch--base-file)
     (user-error "Not in modpatch context"))
 
-  (let* ((base modpatch--base-file)
-         (abs  (expand-file-name patch-file))
-         (entry (modpatch--get-entry base))
-         (pair (modpatch--ensure-patch-record entry abs))
-         (entry* (car pair))
-         (record (cdr pair))
-         (desired-now (buffer-substring-no-properties (point-min) (point-max))))
-    ;; Update record's :desired to current buffer text.
-    (setf (plist-get record :desired) desired-now)
-    ;; Save back
-    (modpatch--set-entry base entry*)
-    (setq modpatch--active-patch-file abs)
-    (modpatch-save-associations)
-    (message "Added and activated patch target %s" abs)))
+  (let* ((base      modpatch--base-file)
+         (base-text (modpatch--read-file-as-string base))
+         (abs       (expand-file-name patch-file))
+         ;; pull or create table entry and patch record
+         (entry     (modpatch--get-entry base))
+         (pair      (modpatch--ensure-patch-record entry abs))
+         (entry*    (car pair))
+         (record    (cdr pair)))
+
+    (if (modpatch--file-nonempty-p abs)
+        ;; CASE 1: Patch file already exists with content.
+        ;; Import it instead of overwriting it.
+        (let* ((patch-text (modpatch--read-file-as-string abs))
+               ;; Apply patch to the current base text to reconstruct its desired.
+               (desired-from-patch
+                (condition-case err
+                    (modpatch--apply-patch base-text patch-text)
+                  (error
+                   ;; If applying fails, we warn, fall back to base content.
+                   (message "modpatch: failed to apply existing patch %s (%s); using base" abs err)
+                   base-text))))
+
+          ;; Update this patch record with imported state.
+          (setf (plist-get record :desired)  desired-from-patch)
+          (setf (plist-get record :base-ref) base-text)
+
+          ;; Update association table and persist.
+          (modpatch--set-entry base entry*)
+          (setq modpatch--active-patch-file abs)
+          (modpatch-save-associations)
+
+          ;; Replace current buffer contents with that reconstructed desired view,
+          ;; so that from here on you're editing the modded result of THIS patch.
+          (modpatch--replace-buffer-with-text desired-from-patch)
+
+          (message "modpatch: imported existing patch %s and activated it" abs))
+
+      ;; CASE 2: Patch file is new or empty.
+      ;; We assume current buffer text is the desired mod for this patch.
+      (let* ((desired-now (buffer-substring-no-properties (point-min) (point-max)))
+             (diff-str    (modpatch--generate-diff
+                           base-text desired-now
+                           (concat base ".orig")
+                           (concat base ".modpatch"))))
+        ;; Write initial diff to abs.
+        (modpatch--write-string-to-file diff-str abs)
+
+        ;; Update patch record with this new state.
+        (setf (plist-get record :desired)  desired-now)
+        (setf (plist-get record :base-ref) base-text)
+
+        ;; Save back to table and persist.
+        (modpatch--set-entry base entry*)
+        (setq modpatch--active-patch-file abs)
+        (modpatch-save-associations)
+
+        ;; Buffer already contains desired-now, so we don't need to change it.
+        ;; Just mark it clean, because we effectively "saved".
+        (set-buffer-modified-p nil)
+
+        (message "modpatch: created and activated new patch %s" abs)))))
 
 
 ;;; Buffer-local state
@@ -725,6 +785,11 @@ This implementation shells out to diff3 -m."
         (ignore-errors (delete-directory tmp-dir t)))
       (when (buffer-live-p merge-buf)
         (kill-buffer merge-buf)))))
+
+(defun modpatch--file-nonempty-p (file)
+  "Return non-nil if FILE exists and is not empty."
+  (and (file-exists-p file)
+       (> (nth 7 (file-attributes file)) 0)))
 
 (provide 'modpatch)
 

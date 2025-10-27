@@ -339,6 +339,7 @@ the current buffer contents become :desired and the current base becomes
 
     ;; In all cases, make this the active patch for the buffer.
     (setq modpatch--active-patch-file patch-abs)
+    (modpatch--update-lighter)
 
     ;; If we adopted, buffer already shows the patched view; if not adopted,
     ;; we keep current buffer text as-is (it will generate the first diff on save).
@@ -363,6 +364,10 @@ In that case we let Emacs save normally, then regenerate patches after save.")
 
 (defvar-local modpatch--rebase-mode-p nil
   "Non-nil if this buffer is in rebase mode (editing the real base file).")
+
+(defvar-local modpatch--mode-line-string " ModPatch"
+  "Modeline lighter for modpatch-mode in this buffer.
+Updated dynamically by `modpatch--update-lighter'.")
 
 
 ;;; Core save interception for patch mode
@@ -496,6 +501,7 @@ After this call, you are looking at the true base file on disk."
   ;; Step 3: mark rebase mode and install after-save hook.
   (setq modpatch--rebase-mode-p t)
   (add-hook 'after-save-hook #'modpatch--after-save-rebase nil t)
+  (modpatch--update-lighter)
 
   (message "modpatch: now editing base on disk; saving updates base, then rewrites all patches"))
 
@@ -526,6 +532,7 @@ Steps:
   ;; Disable rebase behavior.
   (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
   (setq modpatch--rebase-mode-p nil)
+  (modpatch--update-lighter)
 
   (message "modpatch: now editing only patch %s; saving updates that patch"
            modpatch--active-patch-file))
@@ -585,7 +592,8 @@ and enable modpatch-mode. Does nothing if the file is unknown or has no patches.
             (modpatch--replace-buffer-with-text desired)
             (setq modpatch--base-file base)
             (setq modpatch--active-patch-file patch-file)
-            (modpatch-mode 1)))))))
+            (modpatch-mode 1)
+	    (modpatch--update-lighter)))))))
 
 (add-hook 'find-file-hook #'modpatch-maybe-activate)
 
@@ -623,7 +631,7 @@ When `modpatch-enter-rebase-mode' is called:
   produce the recorded desired state.
 
 Use `modpatch-exit-rebase-mode' to switch back."
-  :lighter " ModPatch"
+  :lighter (:eval modpatch--mode-line-string)
   :keymap modpatch-mode-map
   (if modpatch-mode
       ;; enabling
@@ -636,7 +644,9 @@ Use `modpatch-exit-rebase-mode' to switch back."
     ;; disabling
     (remove-hook 'write-contents-functions #'modpatch--write-contents t)
     (remove-hook 'after-save-hook #'modpatch--after-save-rebase t)
-    (setq modpatch--rebase-mode-p nil)))
+    (setq modpatch--rebase-mode-p nil))
+    ;; clear lighter for cleanliness
+    (setq modpatch--mode-line-string " ModPatch"))
 
 (defun modpatch--replace-buffer-with-text (text)
   "Replace entire buffer contents with TEXT, keeping point at start,
@@ -702,6 +712,7 @@ you're working on."
       (modpatch--replace-buffer-with-text desired))
     ;; Mark active patch
     (setq modpatch--active-patch-file (expand-file-name choice))
+    (modpatch--update-lighter)
     (message "modpatch: now editing patch %s" modpatch--active-patch-file)))
 
 (defun modpatch--desired-for-patch (base-abs patch-file &optional force-recompute)
@@ -865,6 +876,7 @@ This command requires:
                 ;; but saving in patch-authoring mode will now fail
                 ;; until the user adds/activates a new patch.
                 (setq modpatch--active-patch-file nil)
+		(modpatch--update-lighter)
                 (message "modpatch: no active patch now; add a new patch target to resume patch saves"))
             ;; There is at least one remaining patch.
             ;; Activate the first remaining patch.
@@ -874,7 +886,96 @@ This command requires:
               (let ((desired (modpatch--desired-for-patch
                               base-abs new-active t)))
                 (modpatch--replace-buffer-with-text desired))
+	      (modpatch--update-lighter)
               (message "modpatch: now editing patch %s" new-active))))))))
+
+(defun modpatch--path-components-forward (path)
+  "Return PATH split into forward-order components.
+The drive-letter element on Windows (`c:`) is kept as a component."
+  (split-string (directory-file-name (expand-file-name path)) "/" t))
+
+
+;;; -------------------------------------------------------------------
+;;; 1.  Disambiguate patch labels
+;;; -------------------------------------------------------------------
+
+(defun modpatch--disambiguate-patch-labels (paths)
+  "Return an alist (ABS-PATH . LABEL) for absolute PATHS.
+
+LABEL is the shortest forward-order suffix that uniquely identifies its
+file among PATHS, always ending with the file name."
+  (let* ((norm   (mapcar #'expand-file-name paths))
+         ;; (ABS . rev-components) - components reversed for fast access
+         (comp   (mapcar (lambda (p)
+                           (cons p (reverse (modpatch--path-components-forward p))))
+                         norm))
+         ;; table: ABS-PATH → current depth (starting with basename only)
+         (depth  (let ((tbl (make-hash-table :test #'equal)))
+                   (dolist (c comp) (puthash (car c) 1 tbl))
+                   tbl))
+         resolved)
+    (while (not resolved)
+      (setq resolved t)
+      (let ((bucket (make-hash-table :test #'equal)))
+        ;; build buckets keyed by provisional label
+        (dolist (c comp)
+          (let* ((path   (car c))
+                 (rev    (cdr c))
+                 (d      (min (gethash path depth) (length rev))) ; clamp
+                 (part   (reverse (cl-subseq rev 0 d)))
+                 (label  (mapconcat #'identity part "/")))
+            (puthash label (cons path (gethash label bucket)) bucket)))
+        ;; for every colliding label, push all its members one component deeper
+        (maphash
+         (lambda (_label same)
+           (when (> (length same) 1)
+             (setq resolved nil)
+             (dolist (p same)
+               (puthash p (1+ (gethash p depth)) depth))))
+         bucket)))
+    ;; final alist
+    (mapcar
+     (lambda (c)
+       (let* ((p     (car c))
+              (rev   (cdr c))
+              (d     (gethash p depth))
+              (label (mapconcat #'identity
+                                (reverse (cl-subseq rev 0 d))
+                                "/")))
+         (cons p label)))
+     comp)))
+
+
+;;; -------------------------------------------------------------------
+;;; 2.  Context-aware active patch label (unchanged)
+;;; -------------------------------------------------------------------
+
+(defun modpatch--active-patch-label ()
+  "Return a user-friendly label for the buffer’s current patch."
+  (cond
+   (modpatch--rebase-mode-p
+    "base")
+   ((not modpatch--active-patch-file)
+    "(no patch)")
+   (t
+    (let* ((base   (and modpatch--base-file
+                        (expand-file-name modpatch--base-file)))
+           (entry  (and base (gethash base modpatch--table))))
+      (if (not entry)
+          (file-name-nondirectory modpatch--active-patch-file)
+        (let* ((all-paths (mapcar (lambda (rec)
+                                    (expand-file-name (plist-get rec :file)))
+                                  (plist-get entry :patches)))
+               (labels    (modpatch--disambiguate-patch-labels all-paths))
+               (target    (expand-file-name modpatch--active-patch-file)))
+          (or (cdr (assoc target labels))
+              (file-name-nondirectory target))))))))
+
+(defun modpatch--update-lighter ()
+  "Update `modpatch--mode-line-string' for the current buffer."
+  (let ((label (modpatch--active-patch-label)))
+    (setq modpatch--mode-line-string
+          (format " ModPatch[%s]" label))))
 
 (provide 'modpatch)
 

@@ -174,11 +174,10 @@ temp file called \"base\"."
                   ;; becomes
                   ;;   --- base
                   ;;   +++ base
-                  (while (re-search-forward
-                          "^[+-]\\{3\\}\\s-+\\([^ \t\n]+\\).*" nil t)
-                    (replace-match (concat (substring (match-string 0) 0 3)
-                                           " base")
-                                   t t))
+		  (dotimes (_ 2)
+                    (when (re-search-forward
+                           "^[+-]\\{3\\}\\s-+\\([^ \t\n]+\\)" nil t)
+                      (replace-match "base" t t nil 1)))
                   (buffer-substring-no-properties
                    (point-min) (point-max))))
 

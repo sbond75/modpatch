@@ -385,24 +385,33 @@ Return non-nil so Emacs believes the buffer is saved and does not write the base
     (unless modpatch--active-patch-file
       (user-error "No active patch file for this buffer. Use modpatch-add-patch-target or modpatch-switch-to-patch-target."))
     (let* ((base modpatch--base-file)
-           (active-patch modpatch--active-patch-file)
            (entry (modpatch--get-entry base))
-           (pair (modpatch--ensure-patch-record entry active-patch))
-           (entry* (car pair))
-           (record (cdr pair))
-           (base-text    (modpatch--read-file-as-string base))
+           (patches (plist-get entry :patches))
+           (base-text (modpatch--read-file-as-string base))
            (desired-text (buffer-substring-no-properties (point-min) (point-max)))
-           (diff-str (modpatch--generate-diff
-                      base-text desired-text
-                      (concat base ".orig")
-                      (concat base ".modpatch"))))
-      ;; write only this patch file
-      (modpatch--write-string-to-file diff-str active-patch)
+           ;; choose target(s) as you already do:
+           (targets (if modpatch--active-patch-file
+                        (list modpatch--active-patch-file)
+                      (mapcar (lambda (r) (plist-get r :file)) patches))))
+
+      ;; Update per-patch desired/base-ref for all targets we are actually writing.
+      (dolist (rec patches)
+        (when (member (plist-get rec :file) targets)
+          (setf (plist-get rec :desired)  desired-text)
+          (setf (plist-get rec :base-ref) base-text)))
+
+      ;; Generate diff and write patch files (as you already do)
+      (let ((diff-str (modpatch--generate-diff
+                       base-text desired-text
+                       (concat base ".orig")
+                       (concat base ".modpatch"))))
+        (dolist (pf targets)
+          (modpatch--write-string-to-file diff-str pf)))
+
       ;; update record
-      (setf (plist-get record :desired)  desired-text)
-      (setf (plist-get record :base-ref) base-text)
+      (setf (plist-get entry :patches) patches)
       ;; save back and persist
-      (modpatch--set-entry base entry*)
+      (modpatch--set-entry base entry)
       (modpatch-save-associations)
       ;; mark clean
       (set-buffer-modified-p nil)
@@ -501,6 +510,23 @@ After this call, you are looking at the true base file on disk."
   (setq modpatch--rebase-mode-p t)
   (add-hook 'after-save-hook #'modpatch--after-save-rebase nil t)
   (modpatch--update-lighter)
+
+  ;; Step 4: ensure that any patch record missing :desired or
+  ;; :base-ref is initialized at that moment based on the current
+  ;; buffer and base.
+  (let* ((base modpatch--base-file)
+	 (entry (modpatch--get-entry base))
+	 (patches (plist-get entry :patches))
+	 (base-text (modpatch--read-file-as-string base))
+	 (desired-text (buffer-substring-no-properties (point-min) (point-max))))
+    (dolist (rec patches)
+      (unless (plist-get rec :desired)
+	(setf (plist-get rec :desired) desired-text))
+      (unless (plist-get rec :base-ref)
+	(setf (plist-get rec :base-ref) base-text)))
+    (setf (plist-get entry :patches) patches)
+    (modpatch--set-entry base entry)
+    (modpatch-save-associations))
 
   (message "modpatch: now editing base on disk; saving updates base, then rewrites all patches"))
 
